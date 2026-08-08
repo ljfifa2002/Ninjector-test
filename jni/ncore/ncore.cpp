@@ -535,8 +535,14 @@ extern "C" void ainject(const char* package_name, const char* so_path) {
 
 __attribute__((destructor()))
 static void ncore_cleanup() {
-    LOGD("ncore: cleanup");
-    unhook_all();
+    LOGD("ncore: cleanup ppid=%d", getppid());
+    // Only the zygote process (parent is init, pid=1) may unhook.  Children
+    // share the hooked code pages (libselinux.so etc.) — DobbyDestroy from a
+    // child process restores the original bytes and read-only permissions,
+    // which crashes the next child's DobbyHook with SIGSEGV SEGV_ACCERR.
+    if (getppid() == 1) {
+        unhook_all();
+    }
     // Do NOT clear the injection lock on process exit — the lock must outlive
     // individual worker processes so subsequent forks see it and skip injection.
     // Lock is only cleared by an explicit aclear() call.
