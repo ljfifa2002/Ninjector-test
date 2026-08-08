@@ -197,6 +197,11 @@ static void write_aclear_addr_file() {
 // authoritative target at child-init time.
 static void write_target_file() {
     if (g_target_package == nullptr || g_target_so == nullptr) return;
+    // Unlink before open to avoid EACCES on O_TRUNC: the file may have been
+    // created by peckerd (root) with an SELinux context that zygote cannot
+    // modify.  unlink + O_CREAT avoids the cross-context write check entirely.
+    // send_status_to_injector() uses the same pattern for the same reason.
+    unlink(NCORE_TARGET_FILE);
     int fd = open(NCORE_TARGET_FILE, O_CREAT | O_WRONLY | O_TRUNC, 0666);
     if (fd < 0) {
         LOGE("ncore: write_target_file open failed errno=%d", errno);
