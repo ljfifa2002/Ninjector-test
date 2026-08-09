@@ -8,7 +8,6 @@
 #include <cstring>
 #include <cstdlib>
 #include <fcntl.h>
-#include <linux/sched.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -165,6 +164,8 @@ static void hooks_state_set(bool active) {
 
 static char* g_target_package = nullptr;
 static char* g_target_so = nullptr;
+static void* g_android_os_Process_setArg = nullptr;
+static void* g_selinux_android_setcontext = nullptr;
 static bool g_payload_loaded = false;
 static bool g_spawn_hooks_installed = false;
 // Set to true by the parent fork hook after the first injection target has been
@@ -326,6 +327,14 @@ static void unload_target_state() {
 static void unhook_all() {
     DobbyDestroy(reinterpret_cast<void*>(fork));
     DobbyDestroy(reinterpret_cast<void*>(vfork));
+    if (g_android_os_Process_setArg != nullptr) {
+        DobbyDestroy(g_android_os_Process_setArg);
+        g_android_os_Process_setArg = nullptr;
+    }
+    if (g_selinux_android_setcontext != nullptr) {
+        DobbyDestroy(g_selinux_android_setcontext);
+        g_selinux_android_setcontext = nullptr;
+    }
     g_spawn_hooks_installed = false;
 }
 
@@ -410,60 +419,68 @@ static bool load_payload_if_needed(const char* package_name) {
     return true;
 }
 
-// Poll /proc/self/cmdline until it matches the current target, then load
-// payload.so.  Runs in a raw clone() thread inside every non-"already_done"
-// child process.  clone() is used instead of pthread_create because after
-// fork only the calling thread survives and bionic's pthread state is
-// incomplete — pthread_create corrupts it and causes selinux_android_setcontext
-// to abort with SIGABRT in ForkAndSpecializeCommon.  clone() bypasses bionic
-// and creates a kernel-level thread directly.
-static int poll_and_load(void*) {
-    char cmdline[256];
-    for (int i = 0; i < 100; i++) {
-        // Re-read the authoritative target each iteration so a task switch
-        // mid-poll still picks up the correct package.
-        sync_target_from_file();
+DECLARE_HOOK(selinux_android_setcontext, int, uid_t uid, bool isSystemServer, const char* seinfo, const char* name) {
+    int result = orig_selinux_android_setcontext(uid, isSystemServer, seinfo, name);
+    LOGD("ncore: selinux_android_setcontext name=%s", name != nullptr ? name : "(null)");
+    load_payload_if_needed(name);
+    return result;
+}
 
-        int fd = open("/proc/self/cmdline", O_RDONLY);
-        if (fd >= 0) {
-            ssize_t n = read(fd, cmdline, sizeof(cmdline) - 1);
-            close(fd);
-            if (n > 0) {
-                cmdline[n] = '\0';
-                // cmdline is \0-separated; first segment is the process name.
-                // load_payload_if_needed internally calls matches_target() which
-                // handles sub-process names (com.foo → com.foo:bar).
-                if (load_payload_if_needed(cmdline)) break;
-            }
-        }
-        usleep(10000); // 10ms
+DECLARE_HOOK(android_os_Process_setArgV0, void, JNIEnv* env, jobject obj, jstring arg) {
+    const char* package_name = env != nullptr && arg != nullptr ? env->GetStringUTFChars(arg, nullptr) : nullptr;
+    if (orig_android_os_Process_setArgV0 != nullptr) {
+        orig_android_os_Process_setArgV0(env, obj, arg);
     }
-    return 0;
+
+    LOGD("ncore: android_os_Process_setArgV0 arg=%s", package_name != nullptr ? package_name : "(null)");
+    load_payload_if_needed(package_name);
+
+    if (env != nullptr && arg != nullptr && package_name != nullptr) {
+        env->ReleaseStringUTFChars(arg, package_name);
+    }
+}
+
+static void install_child_hooks() {
+    // Refresh target from the shared file so that even a stale ncore instance
+    // (whose g_target_package was set by a previous task) uses the current target.
+    sync_target_from_file();
+    LOGI("ncore: installing child hooks pid=%d", getpid());
+
+    g_android_os_Process_setArg = DobbySymbolResolver(
+        "libandroid_runtime.so",
+        "_Z27android_os_Process_setArgV0P7_JNIEnvP8_jobjectP8_jstring");
+    if (g_android_os_Process_setArg != nullptr) {
+        INSTALL_HOOK(android_os_Process_setArgV0, g_android_os_Process_setArg);
+    } else {
+        LOGE("ncore: android_os_Process_setArgV0 not found");
+    }
+
+    g_selinux_android_setcontext = DobbySymbolResolver("libselinux.so", "selinux_android_setcontext");
+    if (g_selinux_android_setcontext != nullptr) {
+        INSTALL_HOOK(selinux_android_setcontext, g_selinux_android_setcontext);
+    } else {
+        LOGE("ncore: selinux_android_setcontext not found");
+    }
 }
 
 DECLARE_HOOK(fork, pid_t, void) {
-	// Snapshot the flag before forking so the child inherits a consistent value.
-	bool already_done = g_injection_done;
-	pid_t pid = orig_fork();
-	if (pid == 0) {
-		// Child process
-		if (already_done) {
-			LOGI("ncore: child forked pid=%d, injection already done, skipping", getpid());
-		} else {
-			LOGI("ncore: child forked pid=%d, spawning poll thread", getpid());
-			char* stack = (char*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-			if (stack != MAP_FAILED) {
-			    long ctid = syscall(__NR_clone, CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM, stack + 4096, 0, 0, 0);
-			    if (ctid == 0) {
-			        poll_and_load(nullptr);
-			        syscall(__NR_exit, 0);
-			    }
-			}
-		}
-	} else if (pid > 0) {
-		LOGD("ncore: parent observed fork child=%d", pid);
-	}
-	return pid;
+    // Snapshot the flag before forking so the child inherits a consistent value.
+    bool already_done = g_injection_done;
+    pid_t pid = orig_fork();
+    if (pid == 0) {
+        // Child process
+        if (already_done) {
+            // Parent confirmed target already injected; skip hooks in this child.
+            LOGI("ncore: child forked pid=%d, injection already done, skipping hooks",
+                 getpid());
+        } else {
+            LOGI("ncore: child forked pid=%d", getpid());
+            install_child_hooks();
+        }
+    } else if (pid > 0) {
+        LOGD("ncore: parent observed fork child=%d", pid);
+    }
+    return pid;
 }
 
 DECLARE_HOOK(vfork, pid_t, void) {
@@ -518,14 +535,8 @@ extern "C" void ainject(const char* package_name, const char* so_path) {
 
 __attribute__((destructor()))
 static void ncore_cleanup() {
-    LOGD("ncore: cleanup ppid=%d", getppid());
-    // Only the zygote process (parent is init, pid=1) may unhook.  Children
-    // share the hooked code pages (libselinux.so etc.) — DobbyDestroy from a
-    // child process restores the original bytes and read-only permissions,
-    // which crashes the next child's DobbyHook with SIGSEGV SEGV_ACCERR.
-    if (getppid() == 1) {
-        unhook_all();
-    }
+    LOGD("ncore: cleanup");
+    unhook_all();
     // Do NOT clear the injection lock on process exit — the lock must outlive
     // individual worker processes so subsequent forks see it and skip injection.
     // Lock is only cleared by an explicit aclear() call.
