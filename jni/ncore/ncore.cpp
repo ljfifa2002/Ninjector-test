@@ -8,7 +8,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <fcntl.h>
-#include <pthread.h>
+#include <linux/sched.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -411,12 +411,13 @@ static bool load_payload_if_needed(const char* package_name) {
 }
 
 // Poll /proc/self/cmdline until it matches the current target, then load
-// payload.so.  Runs as a detached pthread in every non-"already_done" child
-// process.  This replaces the previous DobbyHook-on-shared-code-pages approach
-// (selinux_android_setcontext / android_os_Process_setArgV0) which caused
-// SIGSEGV SEGV_ACCERR in subsequent children when a fresh ncore memfd instance
-// re-hooked an already-trampolined address.
-static void* poll_and_load(void*) {
+// payload.so.  Runs in a raw clone() thread inside every non-"already_done"
+// child process.  clone() is used instead of pthread_create because after
+// fork only the calling thread survives and bionic's pthread state is
+// incomplete — pthread_create corrupts it and causes selinux_android_setcontext
+// to abort with SIGABRT in ForkAndSpecializeCommon.  clone() bypasses bionic
+// and creates a kernel-level thread directly.
+static int poll_and_load(void*) {
     char cmdline[256];
     for (int i = 0; i < 100; i++) {
         // Re-read the authoritative target each iteration so a task switch
@@ -437,7 +438,7 @@ static void* poll_and_load(void*) {
         }
         usleep(10000); // 10ms
     }
-    return nullptr;
+    return 0;
 }
 
 DECLARE_HOOK(fork, pid_t, void) {
@@ -449,10 +450,11 @@ DECLARE_HOOK(fork, pid_t, void) {
 		if (already_done) {
 			LOGI("ncore: child forked pid=%d, injection already done, skipping", getpid());
 		} else {
-			LOGI("ncore: child forked pid=%d, starting poll thread", getpid());
-			pthread_t tid;
-			pthread_create(&tid, nullptr, poll_and_load, nullptr);
-			pthread_detach(tid);
+			LOGI("ncore: child forked pid=%d, spawning poll thread", getpid());
+			char* stack = (char*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if (stack != MAP_FAILED) {
+			    syscall(__NR_clone, CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM, stack + 4096, (long)poll_and_load, 0, 0);
+			}
 		}
 	} else if (pid > 0) {
 		LOGD("ncore: parent observed fork child=%d", pid);
