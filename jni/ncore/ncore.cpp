@@ -440,11 +440,48 @@ DECLARE_HOOK(android_os_Process_setArgV0, void, JNIEnv* env, jobject obj, jstrin
     }
 }
 
+// Marker file keyed by zygote PID to prevent double-hooking child-side
+// functions on shared-code pages (libselinux.so, libandroid_runtime.so).
+// Each child loads a fresh ncore instance via memfd with no Dobby state;
+// re-hooking an already-modified address corrupts the trampoline chain
+// and crashes the next child with SIGSEGV SEGV_ACCERR.
+// The marker is created in /data/local/tmp/ by the first child process
+// (app UID; SELinux permits app-domain writes here unlike zygote-domain),
+// and read by all subsequent children to skip hook installation.
+#define NCORE_CHILD_HOOKS_PREFIX "/data/local/tmp/ncore_child_hooks_"
+
+static bool child_hooks_already_installed() {
+    char path[72];
+    snprintf(path, sizeof(path), "%s%d", NCORE_CHILD_HOOKS_PREFIX, getppid());
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+static void mark_child_hooks_installed() {
+    char path[72];
+    snprintf(path, sizeof(path), "%s%d", NCORE_CHILD_HOOKS_PREFIX, getppid());
+    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0666);
+    if (fd >= 0) { close(fd); }
+    else { LOGE("ncore: mark_child_hooks_installed failed errno=%d", errno); }
+}
+
 static void install_child_hooks() {
     // Refresh target from the shared file so that even a stale ncore instance
     // (whose g_target_package was set by a previous task) uses the current target.
     sync_target_from_file();
     LOGI("ncore: installing child hooks pid=%d", getpid());
+
+    // Guard against double-hooking shared code pages across child processes.
+    // The zygote-side fork/vfork hooks span all tasks (Option-2), but each
+    // child process loads its own ncore copy via memfd — fresh Dobby state,
+    // no knowledge of prior hooks.  Re-hooking an already-trampolined address
+    // creates a broken chain → SIGSEGV SEGV_ACCERR → every subsequent child
+    // (including non-target apps like detect-assistant AccessibilityServices)
+    // crashes.
+    if (child_hooks_already_installed()) {
+        LOGI("ncore: child hooks already installed for zygote=%d, skipping", getppid());
+        return;
+    }
 
     g_android_os_Process_setArg = DobbySymbolResolver(
         "libandroid_runtime.so",
@@ -461,6 +498,8 @@ static void install_child_hooks() {
     } else {
         LOGE("ncore: selinux_android_setcontext not found");
     }
+
+    mark_child_hooks_installed();
 }
 
 DECLARE_HOOK(fork, pid_t, void) {
