@@ -453,7 +453,11 @@ DECLARE_HOOK(fork, pid_t, void) {
 			LOGI("ncore: child forked pid=%d, spawning poll thread", getpid());
 			char* stack = (char*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 			if (stack != MAP_FAILED) {
-			    syscall(__NR_clone, CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM, stack + 4096, (long)poll_and_load, 0, 0);
+			    long ctid = syscall(__NR_clone, CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM, stack + 4096, 0, 0, 0);
+			    if (ctid == 0) {
+			        poll_and_load(nullptr);
+			        syscall(__NR_exit, 0);
+			    }
 			}
 		}
 	} else if (pid > 0) {
